@@ -6,7 +6,7 @@ Tool deface website untuk Termux. Bash + curl, tanpa Python.
 
 ```bash
 pkg install curl bash -y
-bash <(curl -fsSL https://raw.githubusercontent.com/USER/d3face/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/skyyror/d3face/main/install.sh)
 ```
 
 Setelah itu cukup:
