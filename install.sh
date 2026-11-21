@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -eu
-REPO="${D3FACE_REPO:-USER/d3face}"
+REPO="${D3FACE_REPO:-skyyror/d3face}"
 BRANCH="${D3FACE_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
 
